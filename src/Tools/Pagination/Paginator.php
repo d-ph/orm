@@ -29,7 +29,10 @@ use function array_map;
 use function array_sum;
 use function assert;
 use function count;
+use function in_array;
 use function is_string;
+use function reset;
+use function str_starts_with;
 
 /**
  * The paginator can handle various complex scenarios with DQL.
@@ -45,8 +48,8 @@ class Paginator implements Countable, IteratorAggregate
 
     private readonly Query $query;
     private bool|null $useResultQueryOutputWalker = null;
-    private bool|null $useCountQueryOutputWalker = null;
-    private int|null $count             = null;
+    private bool|null $useCountQueryOutputWalker  = null;
+    private int|null $count                       = null;
     /**
      * The auto-detection of queries style was added a lot later to this class, and this
      *  class historically was by default using the more complex queries style, which means that
@@ -55,7 +58,7 @@ class Paginator implements Countable, IteratorAggregate
      *  the simple queries style has been battle-tested enough.
      */
     private bool $queryStyleAutoDetectionEnabled = false;
-    private bool $queryCouldHaveToManyJoins = true;
+    private bool $queryCouldHaveToManyJoins      = true;
 
     /**
      * @param bool $queryCouldProduceDuplicates Whether the query could produce partially duplicated records. One case
@@ -87,13 +90,14 @@ class Paginator implements Countable, IteratorAggregate
         [
             'queryCouldProduceDuplicates' => $queryCouldProduceDuplicates,
             'queryCouldHaveToManyJoins' => $queryCouldHaveToManyJoins,
-        ] = self::autoDetectQueryFeatures($query->getEntityManager(), $queryAST);
+        ]         = self::autoDetectQueryFeatures($query->getEntityManager(), $queryAST);
 
         $paginator = new self($query, $queryCouldProduceDuplicates);
 
         $paginator->queryStyleAutoDetectionEnabled = true;
         $paginator->queryCouldHaveToManyJoins      = $queryCouldHaveToManyJoins;
-        $paginator->useCountQueryOutputWalker      = $queryAST->havingClause !== null;
+        $paginator->useCountQueryOutputWalker      = ! $queryAST instanceof Query\AST\SelectStatement
+            || $queryAST->havingClause !== null;
 
         return $paginator;
     }
@@ -129,12 +133,12 @@ class Paginator implements Countable, IteratorAggregate
             return $queryFeatures;
         }
 
-        $rootAlias = $fromRoot->rangeVariableDeclaration->aliasIdentificationVariable;
+        $rootAlias     = $fromRoot->rangeVariableDeclaration->aliasIdentificationVariable;
         $rootClassName = $fromRoot->rangeVariableDeclaration->abstractSchemaName;
 
-        $aliasesToClassNameOrClassMetadataMap = [];
+        $aliasesToClassNameOrClassMetadataMap             = [];
         $aliasesToClassNameOrClassMetadataMap[$rootAlias] = $rootClassName;
-        $toManyJoinsAliases = [];
+        $toManyJoinsAliases                               = [];
 
         // Check the Joins list.
         foreach ($fromRoot->joins as $join) {
@@ -142,9 +146,9 @@ class Paginator implements Countable, IteratorAggregate
                 return $queryFeatures;
             }
 
-            $joinParentAlias = $join->joinAssociationDeclaration->joinAssociationPathExpression->identificationVariable;
+            $joinParentAlias     = $join->joinAssociationDeclaration->joinAssociationPathExpression->identificationVariable;
             $joinParentFieldName = $join->joinAssociationDeclaration->joinAssociationPathExpression->associationField;
-            $joinAlias = $join->joinAssociationDeclaration->aliasIdentificationVariable;
+            $joinAlias           = $join->joinAssociationDeclaration->aliasIdentificationVariable;
 
             // Every Join descending from a ToMany Join is "in principle" also a ToMany Join
             if (in_array($joinParentAlias, $toManyJoinsAliases, true)) {
@@ -161,8 +165,8 @@ class Paginator implements Countable, IteratorAggregate
             // Load entity class metadata.
             if (is_string($parentClassMetadata)) {
                 try {
-                    $parentClassMetadata = $aliasesToClassNameOrClassMetadataMap[$joinParentAlias]
-                        = $entityManager->getClassMetadata($parentClassMetadata);
+                    $parentClassMetadata                                    = $entityManager->getClassMetadata($parentClassMetadata);
+                    $aliasesToClassNameOrClassMetadataMap[$joinParentAlias] = $parentClassMetadata;
                 } catch (MappingException) {
                     return $queryFeatures;
                 }
@@ -194,8 +198,9 @@ class Paginator implements Countable, IteratorAggregate
             // Must not use any of the ToMany aliases
             if (is_string($selectExpression->expression)) {
                 foreach ($toManyJoinsAliases as $toManyJoinAlias) {
-                    if ($selectExpression->expression === $toManyJoinAlias
-                        || str_starts_with($selectExpression->expression, "{$toManyJoinAlias}.")
+                    if (
+                        $selectExpression->expression === $toManyJoinAlias
+                        || str_starts_with($selectExpression->expression, $toManyJoinAlias . '.')
                     ) {
                         return $queryFeatures;
                     }
@@ -204,8 +209,9 @@ class Paginator implements Countable, IteratorAggregate
 
             // If it's a function, then it has to be one from the following list. Reason: in some databases,
             // there are functions that "generate rows".
-            if ($selectExpression->expression instanceof Query\AST\Functions\FunctionNode
-                && !in_array($selectExpression->expression::class, [
+            if (
+                $selectExpression->expression instanceof Query\AST\Functions\FunctionNode
+                && ! in_array($selectExpression->expression::class, [
                     Query\AST\Functions\CountFunction::class,
                     Query\AST\Functions\AvgFunction::class,
                     Query\AST\Functions\SumFunction::class,
@@ -219,7 +225,8 @@ class Paginator implements Countable, IteratorAggregate
 
         // If there are ToMany Joins, then the Select clause has to use the DISTINCT keyword. Note: the foreach
         // above also ensures that the ToMany Joins are not in the Select list, which is relevant.
-        if (count($toManyJoinsAliases) > 0
+        if (
+            count($toManyJoinsAliases) > 0
             && ! $queryAST->selectClause->isDistinct
         ) {
             return $queryFeatures;
@@ -410,11 +417,7 @@ class Paginator implements Countable, IteratorAggregate
         }
 
         // When a custom output walker already present, then do not use the Paginator's.
-        if ($query->getHint(Query::HINT_CUSTOM_OUTPUT_WALKER) !== false) {
-            return false;
-        }
-
-        return true;
+        return $query->getHint(Query::HINT_CUSTOM_OUTPUT_WALKER) === false;
     }
 
     /**
