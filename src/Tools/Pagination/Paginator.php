@@ -41,7 +41,7 @@ class Paginator implements Countable, IteratorAggregate
     private bool|null $useOutputWalkers = null;
     private int|null $count             = null;
     /**
-     * @var bool The auto-detection of queries style was added a lot later to this class, and this
+     * The auto-detection of queries style was added a lot later to this class, and this
      *  class historically was by default using the more complex queries style, which means that
      *  the simple queries style is potentially very under-tested in production systems. The purpose
      *  of this variable is to not introduce breaking changes until an impression is developed that
