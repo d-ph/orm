@@ -7,14 +7,20 @@ namespace Doctrine\ORM\Tools\Pagination;
 use ArrayIterator;
 use Countable;
 use Doctrine\Common\Collections\Collection;
+use Doctrine\ORM\EntityManagerInterface;
 use Doctrine\ORM\Internal\SQLResultCasing;
+use Doctrine\ORM\Mapping\ClassMetadata;
 use Doctrine\ORM\NoResultException;
 use Doctrine\ORM\Query;
-use Doctrine\ORM\Query\Expr\Join;
+use Doctrine\ORM\Query\AST\Join;
+use Doctrine\ORM\Query\AST\JoinAssociationDeclaration;
+use Doctrine\ORM\Query\AST\Node;
+use Doctrine\ORM\Query\AST\SelectExpression;
 use Doctrine\ORM\Query\Parameter;
 use Doctrine\ORM\Query\Parser;
 use Doctrine\ORM\Query\ResultSetMapping;
 use Doctrine\ORM\QueryBuilder;
+use Doctrine\Persistence\Mapping\MappingException;
 use IteratorAggregate;
 use Traversable;
 
@@ -38,7 +44,8 @@ class Paginator implements Countable, IteratorAggregate
     public const HINT_ENABLE_DISTINCT = 'paginator.distinct.enable';
 
     private readonly Query $query;
-    private bool|null $useOutputWalkers = null;
+    private bool|null $useResultQueryOutputWalker = null;
+    private bool|null $useCountQueryOutputWalker = null;
     private int|null $count             = null;
     /**
      * The auto-detection of queries style was added a lot later to this class, and this
@@ -48,13 +55,15 @@ class Paginator implements Countable, IteratorAggregate
      *  the simple queries style has been battle-tested enough.
      */
     private bool $queryStyleAutoDetectionEnabled = false;
-    /** @var bool|null Null means "undetermined". */
-    private bool|null $queryHasHavingClause = null;
+    private bool $queryCouldHaveToManyJoins = true;
 
-    /** @param bool $fetchJoinCollection Whether the query joins a collection (true by default). */
+    /**
+     * @param bool $queryCouldProduceDuplicates Whether the query could produce partially duplicated records. One case
+     *  when it does is when it joins a collection.
+     */
     public function __construct(
         Query|QueryBuilder $query,
-        private readonly bool $fetchJoinCollection = true,
+        private readonly bool $queryCouldProduceDuplicates = true,
     ) {
         if ($query instanceof QueryBuilder) {
             $query = $query->getQuery();
@@ -68,22 +77,157 @@ class Paginator implements Countable, IteratorAggregate
      * query is suitable for simple (and fast) pagination queries, or whether a complex
      * set of pagination queries has to be used.
      */
-    public static function newWithAutoDetection(QueryBuilder $queryBuilder): self
+    public static function newWithAutoDetection(Query|QueryBuilder $query): self
     {
-        /** @var array<string, Join[]> $joinsPerRootAlias */
-        $joinsPerRootAlias = $queryBuilder->getDQLPart('join');
+        if ($query instanceof QueryBuilder) {
+            $query = $query->getQuery();
+        }
 
-        // For now, only check whether there are any sql joins present in the query. Note,
-        // however, that it is doable to detect a presence of only *ToOne joins via the access to
-        // joined entity classes' metadata (see: QueryBuilder::getEntityManager()->getClassMetadata(className)).
-        $sqlJoinsPresent = count($joinsPerRootAlias) > 0;
+        $queryAST = $query->getAST();
+        [
+            'queryCouldProduceDuplicates' => $queryCouldProduceDuplicates,
+            'queryCouldHaveToManyJoins' => $queryCouldHaveToManyJoins,
+        ] = self::autoDetectQueryFeatures($query->getEntityManager(), $queryAST);
 
-        $paginator = new self($queryBuilder, $sqlJoinsPresent);
+        $paginator = new self($query, $queryCouldProduceDuplicates);
 
         $paginator->queryStyleAutoDetectionEnabled = true;
-        $paginator->queryHasHavingClause           = $queryBuilder->getDQLPart('having') !== null;
+        $paginator->queryCouldHaveToManyJoins      = $queryCouldHaveToManyJoins;
+        $paginator->useCountQueryOutputWalker      = $queryAST->havingClause !== null;
 
         return $paginator;
+    }
+
+    /**
+     * @return array{
+     *  queryCouldProduceDuplicates: bool,
+     *  queryCouldHaveToManyJoins: bool,
+     * }
+     */
+    private static function autoDetectQueryFeatures(EntityManagerInterface $entityManager, Node $queryAST): array
+    {
+        $queryFeatures = [
+            'queryCouldProduceDuplicates' => true,
+            'queryCouldHaveToManyJoins' => true,
+        ];
+
+        if (! $queryAST instanceof Query\AST\SelectStatement) {
+            return $queryFeatures;
+        }
+
+        $from = $queryAST->fromClause->identificationVariableDeclarations;
+        if (count($from) > 1) {
+            return $queryFeatures;
+        }
+
+        $fromRoot = reset($from);
+        if (! $fromRoot instanceof Query\AST\IdentificationVariableDeclaration) {
+            return $queryFeatures;
+        }
+
+        if (! $fromRoot->rangeVariableDeclaration) {
+            return $queryFeatures;
+        }
+
+        $rootAlias = $fromRoot->rangeVariableDeclaration->aliasIdentificationVariable;
+        $rootClassName = $fromRoot->rangeVariableDeclaration->abstractSchemaName;
+
+        $aliasesToClassNameOrClassMetadataMap = [];
+        $aliasesToClassNameOrClassMetadataMap[$rootAlias] = $rootClassName;
+        $toManyJoinsAliases = [];
+
+        // Check the Joins list.
+        foreach ($fromRoot->joins as $join) {
+            if (! $join instanceof Join || ! $join->joinAssociationDeclaration instanceof JoinAssociationDeclaration) {
+                return $queryFeatures;
+            }
+
+            $joinParentAlias = $join->joinAssociationDeclaration->joinAssociationPathExpression->identificationVariable;
+            $joinParentFieldName = $join->joinAssociationDeclaration->joinAssociationPathExpression->associationField;
+            $joinAlias = $join->joinAssociationDeclaration->aliasIdentificationVariable;
+
+            // Every Join descending from a ToMany Join is "in principle" also a ToMany Join
+            if (in_array($joinParentAlias, $toManyJoinsAliases, true)) {
+                $toManyJoinsAliases[] = $joinAlias;
+
+                continue;
+            }
+
+            $parentClassMetadata = $aliasesToClassNameOrClassMetadataMap[$joinParentAlias] ?? null;
+            if (! $parentClassMetadata) {
+                return $queryFeatures;
+            }
+
+            // Load entity class metadata.
+            if (is_string($parentClassMetadata)) {
+                try {
+                    $parentClassMetadata = $aliasesToClassNameOrClassMetadataMap[$joinParentAlias]
+                        = $entityManager->getClassMetadata($parentClassMetadata);
+                } catch (MappingException) {
+                    return $queryFeatures;
+                }
+            }
+
+            $parentJoinAssociationMapping = $parentClassMetadata->associationMappings[$joinParentFieldName] ?? null;
+            if (! $parentJoinAssociationMapping) {
+                return $queryFeatures;
+            }
+
+            $aliasesToClassNameOrClassMetadataMap[$joinAlias] = $parentJoinAssociationMapping['targetEntity'];
+
+            if (! ($parentJoinAssociationMapping['type'] & ClassMetadata::TO_MANY)) {
+                continue;
+            }
+
+            // The Join is a ToMany Join.
+            $toManyJoinsAliases[] = $joinAlias;
+        }
+
+        $queryFeatures['queryCouldHaveToManyJoins'] = count($toManyJoinsAliases) > 0;
+
+        // Check the Select list.
+        foreach ($queryAST->selectClause->selectExpressions as $selectExpression) {
+            if (! $selectExpression instanceof SelectExpression) {
+                return $queryFeatures;
+            }
+
+            // Must not use any of the ToMany aliases
+            if (is_string($selectExpression->expression)) {
+                foreach ($toManyJoinsAliases as $toManyJoinAlias) {
+                    if ($selectExpression->expression === $toManyJoinAlias
+                        || str_starts_with($selectExpression->expression, "{$toManyJoinAlias}.")
+                    ) {
+                        return $queryFeatures;
+                    }
+                }
+            }
+
+            // If it's a function, then it has to be one from the following list. Reason: in some databases,
+            // there are functions that "generate rows".
+            if ($selectExpression->expression instanceof Query\AST\Functions\FunctionNode
+                && !in_array($selectExpression->expression::class, [
+                    Query\AST\Functions\CountFunction::class,
+                    Query\AST\Functions\AvgFunction::class,
+                    Query\AST\Functions\SumFunction::class,
+                    Query\AST\Functions\MinFunction::class,
+                    Query\AST\Functions\MaxFunction::class,
+                ], true)
+            ) {
+                return $queryFeatures;
+            }
+        }
+
+        // If there are ToMany Joins, then the Select clause has to use the DISTINCT keyword. Note: the foreach
+        // above also ensures that the ToMany Joins are not in the Select list, which is relevant.
+        if (count($toManyJoinsAliases) > 0
+            && ! $queryAST->selectClause->isDistinct
+        ) {
+            return $queryFeatures;
+        }
+
+        $queryFeatures['queryCouldProduceDuplicates'] = false;
+
+        return $queryFeatures;
     }
 
     /**
@@ -95,31 +239,80 @@ class Paginator implements Countable, IteratorAggregate
     }
 
     /**
-     * Returns whether the query joins a collection.
+     * @deprecated Use ::getQueryCouldProduceDuplicates() instead.
      *
-     * @return bool Whether the query joins a collection.
+     * Returns whether the query joins a collection.
      */
     public function getFetchJoinCollection(): bool
     {
-        return $this->fetchJoinCollection;
+        return $this->queryCouldProduceDuplicates;
     }
 
     /**
+     * Returns whether the query could produce partially duplicated records.
+     */
+    public function getQueryCouldProduceDuplicates(): bool
+    {
+        return $this->queryCouldProduceDuplicates;
+    }
+
+    /**
+     * @deprecated Use the individual ::get*OutputWalker()
+     *
      * Returns whether the paginator will use an output walker.
      */
     public function getUseOutputWalkers(): bool|null
     {
-        return $this->useOutputWalkers;
+        return $this->getUseResultQueryOutputWalker() && $this->getUseCountQueryOutputWalker();
     }
 
     /**
+     * @deprecated Use the individual ::set*OutputWalker()
+     *
      * Sets whether the paginator will use an output walker.
      *
      * @return $this
      */
     public function setUseOutputWalkers(bool|null $useOutputWalkers): static
     {
-        $this->useOutputWalkers = $useOutputWalkers;
+        $this->setUseResultQueryOutputWalker($useOutputWalkers);
+        $this->setUseCountQueryOutputWalker($useOutputWalkers);
+
+        return $this;
+    }
+
+    /**
+     * Returns whether the paginator will use an output walker for the result query.
+     */
+    public function getUseResultQueryOutputWalker(): bool|null
+    {
+        return $this->useResultQueryOutputWalker;
+    }
+
+    /**
+     * Sets whether the paginator will use an output walker for the result query.
+     */
+    public function setUseResultQueryOutputWalker(bool|null $useResultQueryOutputWalker): static
+    {
+        $this->useResultQueryOutputWalker = $useResultQueryOutputWalker;
+
+        return $this;
+    }
+
+    /**
+     * Returns whether the paginator will use an output walker for the count query.
+     */
+    public function getUseCountQueryOutputWalker(): bool|null
+    {
+        return $this->useCountQueryOutputWalker;
+    }
+
+    /**
+     * Sets whether the paginator will use an output walker for the count query.
+     */
+    public function setUseCountQueryOutputWalker(bool|null $useCountQueryOutputWalker): static
+    {
+        $this->useCountQueryOutputWalker = $useCountQueryOutputWalker;
 
         return $this;
     }
@@ -147,7 +340,7 @@ class Paginator implements Countable, IteratorAggregate
         $offset = $this->query->getFirstResult();
         $length = $this->query->getMaxResults();
 
-        if ($this->fetchJoinCollection && $length !== null) {
+        if ($this->queryCouldProduceDuplicates && $length !== null) {
             $subQuery = $this->cloneQuery($this->query);
 
             if ($this->useOutputWalker($subQuery)) {
@@ -208,8 +401,12 @@ class Paginator implements Countable, IteratorAggregate
      */
     private function useOutputWalker(Query $query, bool $forCountQuery = false): bool
     {
-        if ($this->useOutputWalkers !== null) {
-            return $this->useOutputWalkers;
+        if ($forCountQuery === false && $this->useResultQueryOutputWalker !== null) {
+            return $this->useResultQueryOutputWalker;
+        }
+
+        if ($forCountQuery === true && $this->useCountQueryOutputWalker !== null) {
+            return $this->useCountQueryOutputWalker;
         }
 
         // When a custom output walker already present, then do not use the Paginator's.
@@ -217,14 +414,7 @@ class Paginator implements Countable, IteratorAggregate
             return false;
         }
 
-        // When not joining onto *ToMany relations, then do not use the more complex CountOutputWalker.
-        return ! (
-            $forCountQuery
-            && $this->queryStyleAutoDetectionEnabled
-            && ! $this->fetchJoinCollection
-            // CountWalker doesn't support the "having" clause, while CountOutputWalker does.
-            && $this->queryHasHavingClause === false
-        );
+        return true;
     }
 
     /**
@@ -257,7 +447,7 @@ class Paginator implements Countable, IteratorAggregate
             // When not joining onto *ToMany relations, then use a simpler COUNT query in the CountWalker.
             if (
                 $this->queryStyleAutoDetectionEnabled
-                && ! $this->fetchJoinCollection
+                && ! $this->queryCouldHaveToManyJoins
             ) {
                 $hintDistinctDefaultTrue = false;
             }
