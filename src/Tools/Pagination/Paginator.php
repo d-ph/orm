@@ -88,6 +88,9 @@ class Paginator implements Countable, IteratorAggregate
 
         $queryAST = $query->getAST();
         [
+            'queryHasGroupByClause' => $queryHasGroupByClause,
+            'queryHasHavingClause' => $queryHasHavingClause,
+            'rootEntityHasSingleIdentifierFieldName' => $rootEntityHasSingleIdentifierFieldName,
             'queryCouldProduceDuplicates' => $queryCouldProduceDuplicates,
             'queryCouldHaveToManyJoins' => $queryCouldHaveToManyJoins,
         ]         = self::autoDetectQueryFeatures($query->getEntityManager(), $queryAST);
@@ -96,14 +99,19 @@ class Paginator implements Countable, IteratorAggregate
 
         $paginator->queryStyleAutoDetectionEnabled = true;
         $paginator->queryCouldHaveToManyJoins      = $queryCouldHaveToManyJoins;
-        $paginator->useCountQueryOutputWalker      = ! $queryAST instanceof Query\AST\SelectStatement
-            || $queryAST->havingClause !== null;
+        // The following is ensuring the conditions for when the CountWalker cannot be used.
+        $paginator->useCountQueryOutputWalker = $queryHasHavingClause !== false
+            || $rootEntityHasSingleIdentifierFieldName !== true
+            || ($queryCouldHaveToManyJoins && $queryHasGroupByClause !== false);
 
         return $paginator;
     }
 
     /**
      * @return array{
+     *  queryHasGroupByClause: bool|null,
+     *  queryHasHavingClause: bool|null,
+     *  rootEntityHasSingleIdentifierFieldName: bool|null,
      *  queryCouldProduceDuplicates: bool,
      *  queryCouldHaveToManyJoins: bool,
      * }
@@ -111,6 +119,10 @@ class Paginator implements Countable, IteratorAggregate
     private static function autoDetectQueryFeatures(EntityManagerInterface $entityManager, Node $queryAST): array
     {
         $queryFeatures = [
+            // Null means undetermined
+            'queryHasGroupByClause' => null,
+            'queryHasHavingClause' => null,
+            'rootEntityHasSingleIdentifierFieldName' => null,
             'queryCouldProduceDuplicates' => true,
             'queryCouldHaveToManyJoins' => true,
         ];
@@ -118,6 +130,9 @@ class Paginator implements Countable, IteratorAggregate
         if (! $queryAST instanceof Query\AST\SelectStatement) {
             return $queryFeatures;
         }
+
+        $queryFeatures['queryHasGroupByClause'] = $queryAST->groupByClause !== null;
+        $queryFeatures['queryHasHavingClause']  = $queryAST->havingClause !== null;
 
         $from = $queryAST->fromClause->identificationVariableDeclarations;
         if (count($from) > 1) {
@@ -133,11 +148,18 @@ class Paginator implements Countable, IteratorAggregate
             return $queryFeatures;
         }
 
-        $rootAlias     = $fromRoot->rangeVariableDeclaration->aliasIdentificationVariable;
+        $rootAlias = $fromRoot->rangeVariableDeclaration->aliasIdentificationVariable;
+        try {
+            $rootClassMetadata                                       = $entityManager->getClassMetadata($fromRoot->rangeVariableDeclaration->abstractSchemaName);
+            $queryFeatures['rootEntityHasSingleIdentifierFieldName'] = (bool) $rootClassMetadata->getSingleIdentifierFieldName();
+        } catch (MappingException) {
+            return $queryFeatures;
+        }
+
         $rootClassName = $fromRoot->rangeVariableDeclaration->abstractSchemaName;
 
         $aliasesToClassNameOrClassMetadataMap             = [];
-        $aliasesToClassNameOrClassMetadataMap[$rootAlias] = $rootClassName;
+        $aliasesToClassNameOrClassMetadataMap[$rootAlias] = $rootClassMetadata;
         $toManyJoinsAliases                               = [];
 
         // Check the Joins list.
