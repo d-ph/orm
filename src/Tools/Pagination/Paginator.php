@@ -88,11 +88,11 @@ class Paginator implements Countable, IteratorAggregate
 
         $queryAST = $query->getAST();
         [
-            'queryHasGroupByClause' => $queryHasGroupByClause,
-            'queryHasHavingClause' => $queryHasHavingClause,
+            'hasGroupByClause' => $queryHasGroupByClause,
+            'hasHavingClause' => $queryHasHavingClause,
             'rootEntityHasSingleIdentifierFieldName' => $rootEntityHasSingleIdentifierFieldName,
-            'queryCouldProduceDuplicates' => $queryCouldProduceDuplicates,
-            'queryCouldHaveToManyJoins' => $queryCouldHaveToManyJoins,
+            'couldProduceDuplicates' => $queryCouldProduceDuplicates,
+            'couldHaveToManyJoins' => $queryCouldHaveToManyJoins,
         ]         = self::autoDetectQueryFeatures($query->getEntityManager(), $queryAST);
 
         $paginator = new self($query, $queryCouldProduceDuplicates);
@@ -109,30 +109,30 @@ class Paginator implements Countable, IteratorAggregate
 
     /**
      * @return array{
-     *  queryHasGroupByClause: bool|null,
-     *  queryHasHavingClause: bool|null,
+     *  hasGroupByClause: bool|null,
+     *  hasHavingClause: bool|null,
      *  rootEntityHasSingleIdentifierFieldName: bool|null,
-     *  queryCouldProduceDuplicates: bool,
-     *  queryCouldHaveToManyJoins: bool,
+     *  couldProduceDuplicates: bool,
+     *  couldHaveToManyJoins: bool,
      * }
      */
     private static function autoDetectQueryFeatures(EntityManagerInterface $entityManager, Node $queryAST): array
     {
         $queryFeatures = [
             // Null means undetermined
-            'queryHasGroupByClause' => null,
-            'queryHasHavingClause' => null,
+            'hasGroupByClause' => null,
+            'hasHavingClause' => null,
             'rootEntityHasSingleIdentifierFieldName' => null,
-            'queryCouldProduceDuplicates' => true,
-            'queryCouldHaveToManyJoins' => true,
+            'couldProduceDuplicates' => true,
+            'couldHaveToManyJoins' => true,
         ];
 
         if (! $queryAST instanceof Query\AST\SelectStatement) {
             return $queryFeatures;
         }
 
-        $queryFeatures['queryHasGroupByClause'] = $queryAST->groupByClause !== null;
-        $queryFeatures['queryHasHavingClause']  = $queryAST->havingClause !== null;
+        $queryFeatures['hasGroupByClause'] = $queryAST->groupByClause !== null;
+        $queryFeatures['hasHavingClause']  = $queryAST->havingClause !== null;
 
         $from = $queryAST->fromClause->identificationVariableDeclarations;
         if (count($from) > 1) {
@@ -209,7 +209,7 @@ class Paginator implements Countable, IteratorAggregate
             $toManyJoinsAliases[] = $joinAlias;
         }
 
-        $queryFeatures['queryCouldHaveToManyJoins'] = count($toManyJoinsAliases) > 0;
+        $queryFeatures['couldHaveToManyJoins'] = count($toManyJoinsAliases) > 0;
 
         // Check the Select list.
         foreach ($queryAST->selectClause->selectExpressions as $selectExpression) {
@@ -254,7 +254,7 @@ class Paginator implements Countable, IteratorAggregate
             return $queryFeatures;
         }
 
-        $queryFeatures['queryCouldProduceDuplicates'] = false;
+        $queryFeatures['couldProduceDuplicates'] = false;
 
         return $queryFeatures;
     }
@@ -430,11 +430,11 @@ class Paginator implements Countable, IteratorAggregate
      */
     private function useOutputWalker(Query $query, bool $forCountQuery = false): bool
     {
-        if ($forCountQuery === false && $this->useResultQueryOutputWalker !== null) {
+        if (! $forCountQuery && $this->useResultQueryOutputWalker !== null) {
             return $this->useResultQueryOutputWalker;
         }
 
-        if ($forCountQuery === true && $this->useCountQueryOutputWalker !== null) {
+        if ($forCountQuery && $this->useCountQueryOutputWalker !== null) {
             return $this->useCountQueryOutputWalker;
         }
 
